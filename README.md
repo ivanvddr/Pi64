@@ -14,25 +14,25 @@ The project integrates support for the ILI9341 SPI display, game loading from SD
 To build the project, you will need the following components:
 
  - Microcontroller: Raspberry Pi Pico (RP2040).
-       <br/><img width="300" height="300" alt="pico" src="https://github.com/user-attachments/assets/68d9b6df-caf6-45e0-8408-c5cae55511dc" />
-       
+       <br/><img width="300" height="300" alt="pico" src="https://github.com/user-attachments/assets/57d94fe2-ba95-4041-8d19-b6f1106df1b2" />
+     
  - Display: 2.8" ILI9341 SPI (320×240) with integrated SD reader.
-       <br/><img width="640" height="200" alt="tft-display-2 8-spi" src="https://github.com/user-attachments/assets/4ce2109c-29b0-41c0-ba45-5fe317b2a8a5" />
+       <br/><img width="640" height="200" alt="tft-display-2 8-spi" src="https://github.com/user-attachments/assets/6522d432-fa3d-4541-953e-193235030034" />
 
  - Audio:
     - Low‑pass filter (connected to a PWM GPIO).
     - PAM8403 amplifier (configured in mono mode).
-          <br/><img width="300" height="225" alt="pam8403-1" src="https://github.com/user-attachments/assets/9d73c4bb-145a-495d-a6e7-8a0f6ba51233" />
+          <br/><img width="300" height="225" alt="pam8403-1" src="https://github.com/user-attachments/assets/1a2d5370-dfe8-4518-98e7-7616ac8fd7c8" />
 
     - 3W / 4–8Ω speaker
-          <br/><img width="300" height="300" alt="speaker" src="https://github.com/user-attachments/assets/cce09a0a-7b3b-42a1-acb1-723d2d6a2ad8" />
+          <br/><img width="300" height="300" alt="speaker" src="https://github.com/user-attachments/assets/8fcebdf6-4df0-4d92-b6e8-447f233d5c6f" />
 
  - Input:
     - PS/2 connector for Commodore 64 keyboard (or PC keyboard via adapter).
-          <br/><img width="200" height="204" alt="0f380bbf3fce69dd9c6ff806902553cc" src="https://github.com/user-attachments/assets/0fb0c2a8-b4b7-4224-b3e1-462189474972" />
+          <br/><img width="200" height="204" alt="0f380bbf3fce69dd9c6ff806902553cc" src="https://github.com/user-attachments/assets/071a68a5-559e-4113-a471-bac94645aa31" />
 
     - 2× directional joystick boards with 5‑way switch + 2 buttons (Joystick 1 and 2).
-          <br/><br/><img width="300" height="161" alt="COM-5WS-01" src="https://github.com/user-attachments/assets/dd61c84c-3fa6-4464-bef1-b97421cf737c" />
+          <br/><br/><img width="300" height="161" alt="COM-5WS-01" src="https://github.com/user-attachments/assets/ae02c59a-e821-4228-8e59-e08bd2625be7" />
 
 
 
