@@ -3,7 +3,7 @@ Pi64 is a Commodore 64 emulator developed for the Raspberry Pi Pico (RP2040) usi
 The project integrates support for the ILI9341 SPI display, game loading from SD card, PS/2 keyboard input, and PWM audio output.
 
 # 🚀 Features
-  -  Core: Emulation of 6502 CPU, CIA1/2 and VIC-II.
+  -  Core: Emulation of 6502 (6510) CPU, CIA1/2 and VIC-II.
   -  Display: ILI9341 320×240 SPI support.
   -  Storage: Loading .prg files and .jpg previews from MicroSD.
   -  Audio: PWM sound generation with analog low‑pass filter.
@@ -28,7 +28,7 @@ To build the project, you will need the following components:
           <br/><img width="300" height="300" alt="speaker" src="https://github.com/user-attachments/assets/8fcebdf6-4df0-4d92-b6e8-447f233d5c6f" />
 
  - Input:
-    - PS/2 connector for Commodore 64 keyboard (or PC keyboard via adapter).
+    - PS/2 connector for a PC keyboard to use in Basic mode.
           <br/><img width="200" height="204" alt="0f380bbf3fce69dd9c6ff806902553cc" src="https://github.com/user-attachments/assets/071a68a5-559e-4113-a471-bac94645aa31" />
 
     - 2× directional joystick boards with 5‑way switch + 2 buttons (Joystick 1 and 2).
