@@ -12,6 +12,56 @@
  * ma SENZA ALCUNA GARANZIA; senza neppure la garanzia implicita
  * di COMMERCIABILITÀ o IDONEITÀ PER UN PARTICOLARE SCOPO.
  * Vedi la licenza GPLv3 per maggiori dettagli.
+ *
+ * ============================================================================
+ * FIX DI FEDELTÀ (2026):
+ *
+ * 1) PAGE-CROSSING PENALTY: la ticktable conteneva già i conteggi "base"
+ *    corretti, ma mancava la penalità dinamica di +1 ciclo quando
+ *    un'istruzione di LETTURA in modalità abs,X / abs,Y / (ind),Y
+ *    attraversa un confine di pagina. Non si applica a store, a RMW
+ *    (INC/DEC, shift/rotate, e i combo illegali SLO/RLA/SRE/RRA/DCP/ISC),
+ *    che costano sempre il massimo fisso già presente in ticktable.
+ *
+ * 2) COSTO DEGLI INTERRUPT: nmi()/irq() ora scalano correttamente 7 cicli
+ *    dal budget (clockgoal6502) e vengono contati in realtickcount, prima
+ *    non contabilizzati -> desync cumulativo CPU/VIC/CIA ad ogni raster IRQ.
+ *
+ * 3) CONTROLLO INTERRUPT AD OGNI ISTRUZIONE: prima si controllava NMI/IRQ
+ *    ogni 8 istruzioni per "ottimizzazione". Per il VIC-II questo è ancora
+ *    più critico che per una PPU: i raster IRQ usati per gli split-screen
+ *    vanno serviti con precisione di 1 istruzione. Il costo (due if su
+ *    puntatori) è trascurabile.
+ *
+ * 4) CONTABILITÀ CICLI PAGE-CROSS/BRANCH: la penalità decrementava
+ *    correttamente clockgoal6502 (il loop si fermava al momento giusto)
+ *    ma non veniva mai sommata a realtickcount, che è il valore restituito
+ *    al chiamante e usato per pilotare cia1.update()/cia2.update(): era
+ *    quindi sistematicamente sottostimato di 1-2 cicli ad ogni page-cross
+ *    o branch preso. Corretto accumulando la penalità in extraCyclesAccum
+ *    e sommandola una sola volta, insieme al costo base, in execCPU().
+ *
+ * 5) FLAG OVERFLOW IN SBC (path binario): l'overflow veniva calcolato con
+ *    la stessa formula di ADC ma passando 'value' non invertito. SBC è
+ *    aritmeticamente ADC(a, ~value, carry), quindi V va calcolato su
+ *    ~value. Verificato con A=0x80, M=0x01, no borrow: la vecchia formula
+ *    restituiva V=0 invece di V=1. Il fix è applicato SOLO al ramo binario
+ *    di SBC/ISC: il ramo BCD resta invariato, perché il
+ *    comportamento del flag V in modalità decimale sul 6502 reale è un
+ *    caso a parte e non è ciò che questo fix indirizza.
+ *
+ * 6) RTI: mancava "| FLAG_CONSTANT" dopo il pull dello status register
+ *    (il bit 5, sempre letto come 1 sullo stack reale).
+ *
+ * 7) NOP illegali con operando (zp/zpx/abs/abs,X): ora eseguono davvero la
+ *    lettura dell'operando (prima veniva solo saltato il PC). Su hardware
+ *    vero questi opcode ILLEGALI eseguono comunque il fetch, e se
+ *    l'indirizzo calcolato cade su un registro I/O (VIC-II, CIA) il read
+ *    ha un side-effect reale (es. leggere l'ICR di una CIA ne cancella i
+ *    flag di interrupt pendenti). abs,X inoltre prende la stessa penalità
+ *    di page-cross delle altre letture indicizzate.
+ *
+ * ============================================================================
  */
 
 #include "cpu.h"
@@ -76,8 +126,27 @@
 			clearoverflow();                              \
 	}
 
+// Penalità di pagina (+1 ciclo) per le istruzioni di LETTURA indicizzate
+// (abs,X / abs,Y / (ind),Y) quando l'indirizzamento attraversa un confine
+// di pagina. NON si applica a store né a RMW (INC/DEC, shift/rotate, e i
+// combo illegali SLO/RLA/SRE/RRA/DCP/ISC), che costano sempre il massimo
+// fisso già presente in ticktable.
+//
+// Accumula la penalità in extraCyclesAccum invece di toccare direttamente
+// clockgoal6502: viene sommata insieme al costo base UNA SOLA VOLTA nel
+// loop principale di execCPU(), così sia il budget del loop (clockgoal6502)
+// sia il valore restituito al chiamante (realtickcount, usato per pilotare
+// cia1.update()/cia2.update() in video_callback) restano coerenti fra loro.
+#define PAGE_CROSS_PENALTY(base, eff) \
+    { if (((base) ^ (eff)) & 0xFF00) extraCyclesAccum++; }
+
 // variabili di supporto
 int32_t clockgoal6502 = 0;
+// Penalità (page-cross e branch preso/attraversamento pagina) accumulate
+// durante l'esecuzione dell'istruzione corrente, azzerata ad ogni fetch e
+// sommata al costo base una sola volta in execCPU() (vedi fix #4 in testa
+// al file).
+static int32_t extraCyclesAccum = 0;
 uint8_t opcode;
 
 
@@ -437,6 +506,10 @@ void cpu::initOpcodeTable() {
     opcodeTable[0xFC] = &cpu::op_nop_absx;
     
     // ===== JAM opcodes (halt) =====
+    // Restano mappate a NOP (comportamento invariato rispetto alla
+    // versione precedente): un vero 6502 si bloccherebbe per sempre,
+    // qui si preferisce non rischiare di appendere l'intero firmware
+    // se un bug altrove esegue per errore un opcode JAM.
     opcodeTable[0x02] = &cpu::op_nop;
     opcodeTable[0x12] = &cpu::op_nop;
     opcodeTable[0x22] = &cpu::op_nop;
@@ -539,7 +612,8 @@ inline uint8_t cpu::pull8() {
 }
 
 // ============================================================================
-// INTERRUPT HANDLERS
+// INTERRUPT HANDLERS (ora con costo di 7 cicli correttamente contabilizzato
+// nel budget del loop di esecuzione, vedi fix #2 in testa al file)
 // ============================================================================
 
 void cpu::nmi() {
@@ -547,6 +621,7 @@ void cpu::nmi() {
     push8((cpustatus & ~FLAG_BREAK) | FLAG_CONSTANT);    
     setinterrupt();    
     pc = (uint16_t)mem_read(0xFFFA) | ((uint16_t)mem_read(0xFFFB) << 8);
+    clockgoal6502 -= 7;
 }
 
 void cpu::irq() {
@@ -558,6 +633,7 @@ void cpu::irq() {
     push8((cpustatus & ~FLAG_BREAK) | FLAG_CONSTANT);
     setinterrupt();
     pc = (uint16_t)mem_read(0xFFFE) | ((uint16_t)mem_read(0xFFFF) << 8);
+    clockgoal6502 -= 7;
 }
 
 // ============================================================================
@@ -567,39 +643,42 @@ void cpu::irq() {
 int cpu::execCPU(int tickcount) {
     clockgoal6502 = tickcount;
     int realtickcount = 0;
-    
-    int instrCount = 0;
-    const int INTERRUPT_CHECK_INTERVAL = 8;
-    
+
     while (clockgoal6502 > 0) {
-        if ((instrCount++ & (INTERRUPT_CHECK_INTERVAL - 1)) == 0) {
-            // NMI Check
-            if (_cia2 && _cia2->hasNMI()) {
-                nmi();
+        // Controllo NMI/IRQ ad OGNI istruzione (vedi fix #3 in testa al
+        // file: prima si controllava ogni 8 istruzioni, impreciso per i
+        // raster IRQ del VIC-II usati per gli split-screen).
+        if (_cia2 && _cia2->hasNMI()) {
+            nmi();
+            realtickcount += 7;
+        }
+
+        if (!(cpustatus & FLAG_INTERRUPT)) {
+            bool irq_pending = false;
+
+            if (_vic2 && _vic2->hasIRQ()) {
+                irq_pending = true;
             }
-            
-            // IRQ Check
-            if (!(cpustatus & FLAG_INTERRUPT)) {
-                bool irq_pending = false;
-                
-                if (_vic2 && _vic2->hasIRQ()) {
+
+            if (_cia1 && !irq_pending && _cia1->hasIRQ()) {
+                uint8_t cia1_icr = _cia1->read(0x0D);
+                if (cia1_icr & 0x80) {
                     irq_pending = true;
                 }
-                
-                if (_cia1 && !irq_pending && _cia1->hasIRQ()) {
-                    uint8_t cia1_icr = _cia1->read(0x0D);
-                    if (cia1_icr & 0x80) {
-                        irq_pending = true;
-                    }
-                }
-                
-                if (irq_pending) {
-                    // NON fare auto-ACK qui
-                    irq();
-                }
+            }
+
+            if (irq_pending) {
+                // NON fare auto-ACK qui
+                irq();
+                realtickcount += 7;
             }
         }
-        
+
+        // Azzerata prima del fetch: accumula le eventuali penalità
+        // page-cross/branch maturate DURANTE l'esecuzione dell'istruzione
+        // (vedi fix #4 in testa al file).
+        extraCyclesAccum = 0;
+
         opcode = mem_read(pc++);
         cpustatus |= FLAG_CONSTANT;
         (this->*opcodeTable[opcode])();
@@ -609,7 +688,7 @@ int cpu::execCPU(int tickcount) {
         //    _vic2->stepCPU();
         //}
         
-        int cycles = ticktable[opcode];
+        int cycles = ticktable[opcode] + extraCyclesAccum;
         clockgoal6502 -= cycles;
         realtickcount += cycles;
     }
@@ -650,16 +729,20 @@ void cpu::op_lda_abs() {
 }
 
 void cpu::op_lda_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     a = mem_read(addr);
     zerocalc(a);
     signcalc(a);
 }
 
 void cpu::op_lda_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a = mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -675,7 +758,9 @@ void cpu::op_lda_indx() {
 
 void cpu::op_lda_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a = mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -714,8 +799,10 @@ void cpu::op_ldx_abs() {
 }
 
 void cpu::op_ldx_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     x = mem_read(addr);
     zerocalc(x);
     signcalc(x);
@@ -754,15 +841,17 @@ void cpu::op_ldy_abs() {
 }
 
 void cpu::op_ldy_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     y = mem_read(addr);
     zerocalc(y);
     signcalc(y);
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: STA (Store Accumulator)
+// ISTRUZIONI FUSE: STA (Store Accumulator) - nessuna penalità di pagina
 // ============================================================================
 
 void cpu::op_sta_zp() {
@@ -846,7 +935,7 @@ void cpu::op_sty_abs() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: ADC (Add with Carry)
+// ISTRUZIONI FUSE: ADC (Add with Carry) - BCD mantenuto (6510 vero)
 // ============================================================================
 
 void cpu::op_adc_imm() {
@@ -942,8 +1031,10 @@ void cpu::op_adc_abs() {
 }
 
 void cpu::op_adc_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) + (value & 0x0F) + (cpustatus & FLAG_CARRY);
@@ -966,8 +1057,10 @@ void cpu::op_adc_absx() {
 }
 
 void cpu::op_adc_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) + (value & 0x0F) + (cpustatus & FLAG_CARRY);
@@ -1015,7 +1108,9 @@ void cpu::op_adc_indx() {
 
 void cpu::op_adc_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) + (value & 0x0F) + (cpustatus & FLAG_CARRY);
@@ -1038,7 +1133,12 @@ void cpu::op_adc_indy() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: SBC (Subtract with Carry)
+// ISTRUZIONI FUSE: SBC (Subtract with Carry) - BCD mantenuto (6510 vero)
+//
+// FIX #5: nel ramo BINARIO (else), l'overflow va calcolato su ~value e non
+// su value: SBC è aritmeticamente ADC(a, ~value, carry). Il ramo BCD non è
+// toccato: il comportamento del flag V in modalità decimale sul 6502 reale
+// è un caso a parte, non indirizzato da questo fix.
 // ============================================================================
 
 void cpu::op_sbc_imm() {
@@ -1058,7 +1158,7 @@ void cpu::op_sbc_imm() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -1081,7 +1181,7 @@ void cpu::op_sbc_zp() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -1104,7 +1204,7 @@ void cpu::op_sbc_zpx() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -1128,14 +1228,16 @@ void cpu::op_sbc_abs() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
 
 void cpu::op_sbc_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) - (value & 0x0F) - ((cpustatus & FLAG_CARRY) ? 0 : 1);
@@ -1152,14 +1254,16 @@ void cpu::op_sbc_absx() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
 
 void cpu::op_sbc_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) - (value & 0x0F) - ((cpustatus & FLAG_CARRY) ? 0 : 1);
@@ -1176,7 +1280,7 @@ void cpu::op_sbc_absy() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -1200,14 +1304,16 @@ void cpu::op_sbc_indx() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
 
 void cpu::op_sbc_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) - (value & 0x0F) - ((cpustatus & FLAG_CARRY) ? 0 : 1);
@@ -1224,7 +1330,7 @@ void cpu::op_sbc_indy() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -1262,16 +1368,20 @@ void cpu::op_and_abs() {
 }
 
 void cpu::op_and_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     a &= mem_read(addr);
     zerocalc(a);
     signcalc(a);
 }
 
 void cpu::op_and_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a &= mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -1287,7 +1397,9 @@ void cpu::op_and_indx() {
 
 void cpu::op_and_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a &= mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -1326,16 +1438,20 @@ void cpu::op_ora_abs() {
 }
 
 void cpu::op_ora_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     a |= mem_read(addr);
     zerocalc(a);
     signcalc(a);
 }
 
 void cpu::op_ora_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a |= mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -1351,7 +1467,9 @@ void cpu::op_ora_indx() {
 
 void cpu::op_ora_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a |= mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -1390,16 +1508,20 @@ void cpu::op_eor_abs() {
 }
 
 void cpu::op_eor_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     a ^= mem_read(addr);
     zerocalc(a);
     signcalc(a);
 }
 
 void cpu::op_eor_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a ^= mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -1415,7 +1537,9 @@ void cpu::op_eor_indx() {
 
 void cpu::op_eor_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a ^= mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -1462,8 +1586,10 @@ void cpu::op_cmp_abs() {
 }
 
 void cpu::op_cmp_absx() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + x;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     uint16_t result = (uint16_t)a - value;
     if (a >= value) setcarry(); else clearcarry();
@@ -1472,8 +1598,10 @@ void cpu::op_cmp_absx() {
 }
 
 void cpu::op_cmp_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     uint16_t result = (uint16_t)a - value;
     if (a >= value) setcarry(); else clearcarry();
@@ -1493,7 +1621,9 @@ void cpu::op_cmp_indx() {
 
 void cpu::op_cmp_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     uint8_t value = mem_read(addr);
     uint16_t result = (uint16_t)a - value;
     if (a >= value) setcarry(); else clearcarry();
@@ -1502,7 +1632,8 @@ void cpu::op_cmp_indy() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: CPX/CPY (Compare X/Y)
+// ISTRUZIONI FUSE: CPX/CPY (Compare X/Y) - nessuna modalità indicizzata,
+// nessuna penalità di pagina applicabile.
 // ============================================================================
 
 void cpu::op_cpx_imm() {
@@ -1581,7 +1712,7 @@ void cpu::op_bit_abs() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: ASL (Arithmetic Shift Left)
+// ISTRUZIONI FUSE: ASL (Arithmetic Shift Left) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_asl_acc() {
@@ -1635,7 +1766,7 @@ void cpu::op_asl_absx() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: LSR (Logical Shift Right)
+// ISTRUZIONI FUSE: LSR (Logical Shift Right) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_lsr_acc() {
@@ -1688,7 +1819,7 @@ void cpu::op_lsr_absx() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: ROL (Rotate Left)
+// ISTRUZIONI FUSE: ROL (Rotate Left) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_rol_acc() {
@@ -1742,7 +1873,7 @@ void cpu::op_rol_absx() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: ROR (Rotate Right)
+// ISTRUZIONI FUSE: ROR (Rotate Right) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_ror_acc() {
@@ -1796,7 +1927,7 @@ void cpu::op_ror_absx() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: INC/DEC (Increment/Decrement Memory)
+// ISTRUZIONI FUSE: INC/DEC (Increment/Decrement Memory) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_inc_zp() {
@@ -1892,7 +2023,13 @@ void cpu::op_dey() {
 }
 
 // ============================================================================
-// ISTRUZIONI FUSE: BRANCHES (ottimizzate con calcolo cicli)
+// ISTRUZIONI FUSE: BRANCHES
+//
+// FIX #4: la penalità (branch preso / attraversamento pagina) va
+// nell'accumulatore condiviso extraCyclesAccum, sommata al costo base nel
+// loop principale di execCPU() — prima veniva sottratta solo a
+// clockgoal6502, senza mai finire in realtickcount (vedi commento sopra
+// PAGE_CROSS_PENALTY in testa al file).
 // ============================================================================
 
 void cpu::op_bpl() {
@@ -1900,7 +2037,7 @@ void cpu::op_bpl() {
     if ((cpustatus & FLAG_SIGN) == 0) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1909,7 +2046,7 @@ void cpu::op_bmi() {
     if (cpustatus & FLAG_SIGN) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1918,7 +2055,7 @@ void cpu::op_bvc() {
     if ((cpustatus & FLAG_OVERFLOW) == 0) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1927,7 +2064,7 @@ void cpu::op_bvs() {
     if (cpustatus & FLAG_OVERFLOW) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1936,7 +2073,7 @@ void cpu::op_bcc() {
     if ((cpustatus & FLAG_CARRY) == 0) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1945,7 +2082,7 @@ void cpu::op_bcs() {
     if (cpustatus & FLAG_CARRY) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1954,7 +2091,7 @@ void cpu::op_bne() {
     if ((cpustatus & FLAG_ZERO) == 0) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1963,7 +2100,7 @@ void cpu::op_beq() {
     if (cpustatus & FLAG_ZERO) {
         uint16_t oldpc = pc;
         pc += offset;
-        clockgoal6502 -= ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
+        extraCyclesAccum += ((oldpc & 0xFF00) != (pc & 0xFF00)) ? 2 : 1;
     }
 }
 
@@ -1991,8 +2128,10 @@ void cpu::op_rts() {
     pc = pull16() + 1;
 }
 
+// FIX #6: mancava "| FLAG_CONSTANT" dopo il pull dello status register
+// (il bit 5 è sempre letto come 1 sullo stack reale).
 void cpu::op_rti() {
-    cpustatus = pull8();
+    cpustatus = pull8() | FLAG_CONSTANT;
     pc = pull16();
 }
 
@@ -2102,30 +2241,45 @@ void cpu::op_nop() {
 
 // ============================================================================
 // NOP variants (illegal opcodes)
+//
+// FIX #7: ora eseguono davvero la lettura dell'operando (prima veniva solo
+// saltato il PC). Su hardware vero questi opcode illegali eseguono comunque
+// il fetch, e se l'indirizzo calcolato cade su un registro I/O il read ha
+// un side-effect reale (es. leggere l'ICR di una CIA ne cancella i flag di
+// interrupt pendenti). op_nop_absx prende inoltre la stessa penalità di
+// page-cross delle altre letture indicizzate.
 // ============================================================================
 
 void cpu::op_nop_imm() {
-    pc++; // Skip immediate byte
+    pc++; // Skip immediate byte (nessun indirizzo di memoria coinvolto)
 }
 
 void cpu::op_nop_zp() {
-    pc++; // Skip zero page address
+    uint16_t addr = mem_read(pc++);
+    (void)mem_read(addr);
 }
 
 void cpu::op_nop_zpx() {
-    pc++; // Skip zero page address
+    uint16_t addr = (mem_read(pc++) + x) & 0xFF;
+    (void)mem_read(addr);
 }
 
 void cpu::op_nop_abs() {
-    pc += 2; // Skip absolute address
+    uint16_t addr = mem_read(pc) | (mem_read(pc + 1) << 8);
+    pc += 2;
+    (void)mem_read(addr);
 }
 
 void cpu::op_nop_absx() {
-    pc += 2; // Skip absolute address
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
+    pc += 2;
+    uint16_t addr = base + x;
+    PAGE_CROSS_PENALTY(base, addr);
+    (void)mem_read(addr);
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: SLO (ASL + ORA)
+// ILLEGAL OPCODES FUSED: SLO (ASL + ORA) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_slo_zp() {
@@ -2211,7 +2365,7 @@ void cpu::op_slo_indy() {
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: RLA (ROL + AND)
+// ILLEGAL OPCODES FUSED: RLA (ROL + AND) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_rla_zp() {
@@ -2297,7 +2451,7 @@ void cpu::op_rla_indy() {
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: SRE (LSR + EOR)
+// ILLEGAL OPCODES FUSED: SRE (LSR + EOR) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_sre_zp() {
@@ -2370,8 +2524,20 @@ void cpu::op_sre_indx() {
     signcalc(a);
 }
 
+void cpu::op_sre_indy() {
+    uint16_t zp = mem_read(pc++);
+    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint8_t value = mem_read(addr);
+    if (value & 1) setcarry(); else clearcarry();
+    uint8_t result = value >> 1;
+    mem_write(addr, result);
+    a ^= result;
+    zerocalc(a);
+    signcalc(a);
+}
+
 // ============================================================================
-// ILLEGAL OPCODES FUSED: RRA (ROR + ADC)
+// ILLEGAL OPCODES FUSED: RRA (ROR + ADC) - RMW, costo fisso, BCD mantenuto
 // ============================================================================
 
 void cpu::op_rra_zp() {
@@ -2381,7 +2547,6 @@ void cpu::op_rra_zp() {
     if (value & 1) setcarry(); else clearcarry();
     mem_write(addr, result);
     
-    // ADC part
     if (cpustatus & FLAG_DECIMAL) {
         uint16_t tmp = (a & 0x0F) + (result & 0x0F) + (cpustatus & FLAG_CARRY);
         if (tmp > 9) tmp += 6;
@@ -2570,7 +2735,7 @@ void cpu::op_rra_indy() {
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: LAX (LDA + LDX)
+// ILLEGAL OPCODES FUSED: LAX (LDA + LDX) - absy/indy con penalità di pagina
 // ============================================================================
 
 void cpu::op_lax_zp() {
@@ -2596,8 +2761,10 @@ void cpu::op_lax_abs() {
 }
 
 void cpu::op_lax_absy() {
-    uint16_t addr = (mem_read(pc) | (mem_read(pc + 1) << 8)) + y;
+    uint16_t base = mem_read(pc) | (mem_read(pc + 1) << 8);
     pc += 2;
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a = x = mem_read(addr);
     zerocalc(a);
     signcalc(a);
@@ -2613,14 +2780,16 @@ void cpu::op_lax_indx() {
 
 void cpu::op_lax_indy() {
     uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
+    uint16_t base = mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8);
+    uint16_t addr = base + y;
+    PAGE_CROSS_PENALTY(base, addr);
     a = x = mem_read(addr);
     zerocalc(a);
     signcalc(a);
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: SAX (Store A AND X)
+// ILLEGAL OPCODES FUSED: SAX (Store A AND X) - nessuna penalità di pagina
 // ============================================================================
 
 void cpu::op_sax_zp() {
@@ -2646,7 +2815,7 @@ void cpu::op_sax_indx() {
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: DCP (DEC + CMP)
+// ILLEGAL OPCODES FUSED: DCP (DEC + CMP) - RMW, costo fisso
 // ============================================================================
 
 void cpu::op_dcp_zp() {
@@ -2725,7 +2894,10 @@ void cpu::op_dcp_indy() {
 }
 
 // ============================================================================
-// ILLEGAL OPCODES FUSED: ISC (INC + SBC)
+// ILLEGAL OPCODES FUSED: ISC (INC + SBC) - RMW, costo fisso, BCD mantenuto
+//
+// FIX #5: nel ramo BINARIO (else), overflow calcolato su ~value (idem a SBC
+// normale). Ramo BCD invariato.
 // ============================================================================
 
 void cpu::op_isc_zp() {
@@ -2748,7 +2920,7 @@ void cpu::op_isc_zp() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -2773,7 +2945,7 @@ void cpu::op_isc_zpx() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -2799,7 +2971,7 @@ void cpu::op_isc_abs() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -2825,7 +2997,7 @@ void cpu::op_isc_absx() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -2851,7 +3023,7 @@ void cpu::op_isc_absy() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
@@ -2877,32 +3049,10 @@ void cpu::op_isc_indx() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
-
-
-// ============================================================================
-// ILLEGAL OPCODES FUSED: SRE (LSR + EOR)
-// ============================================================================
-
-void cpu::op_sre_indy() {
-    uint16_t zp = mem_read(pc++);
-    uint16_t addr = (mem_read(zp) | (mem_read((zp + 1) & 0xFF) << 8)) + y;
-    uint8_t value = mem_read(addr);
-    if (value & 1) setcarry(); else clearcarry();
-    uint8_t result = value >> 1;
-    mem_write(addr, result);
-    a ^= result;
-    zerocalc(a);
-    signcalc(a);
-}
-
-// ============================================================================
-// ILLEGAL OPCODES FUSED: ISC (INC + SBC)
-// ============================================================================
-
 
 void cpu::op_isc_indy() {
     uint16_t zp = mem_read(pc++);
@@ -2925,13 +3075,13 @@ void cpu::op_isc_indy() {
         if (result < 0x100) setcarry(); else clearcarry();
         zerocalc(result);
         signcalc(result);
-        overflowcalc(result, a, value);
+        overflowcalc(result, a, (uint8_t)(~value));
         a = (uint8_t)(result & 0xFF);
     }
 }
 
 // ============================================================================
-// ILLEGAL OPCODES: Altri opcodes speciali
+// ILLEGAL OPCODES: Altri opcodes speciali (invariati)
 // ============================================================================
 
 void cpu::op_anc_imm() {

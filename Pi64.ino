@@ -41,6 +41,8 @@
 #include "C64GameBrowser.h"
 #include "SkipKeysUtils.h"
 #include <Arduino.h>
+#include "hardware/vreg.h"    // Per vreg_set_voltage
+#include "hardware/clocks.h"  // Per clock_configure e clk_peri
 
 TFT_eSPI tft;
 cpu cpu;
@@ -376,7 +378,15 @@ void C64loop() {
 
 void setup() {
     //imposta clock del pico
+    vreg_set_voltage(VREG_VOLTAGE_1_20);
     set_sys_clock_khz(PICO_CLOCK_KHZ, true);
+    clock_configure(
+      clk_peri,
+      0, // Nessun glitchless mux
+      CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS, // Sorgente: System PLL
+      PICO_CLOCK_KHZ * 1000, // Frequenza di ingresso (276 MHz)
+      PICO_CLOCK_KHZ * 1000  // Frequenza richiesto in uscita (276 MHz)
+    );
   
     Serial.begin(115200);
     unsigned long t = millis();
