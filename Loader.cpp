@@ -169,7 +169,7 @@ void Loader::eseguiRUN() {
     _cpu->sp = 0xFF;
     _cpu->cpustatus = 0x20 | 0x04;  // FLAG_CONSTANT | FLAG_INTERRUPT disabled
     
-    Serial.printf("tarting BASIC RUN at PC=$%04X\n", _cpu->pc);
+    Serial.printf("Starting BASIC RUN at PC=$%04X\n", _cpu->pc);
 }
 
 void Loader::eseguiPRG(uint16_t indirizzoInizio) {
@@ -363,8 +363,12 @@ bool Loader::initSD() {
     SPI1.begin();
     
     delay(100);
+
+    // Forza un clock SPI basso e sicuro, invece del default
+    //const uint32_t SD_SPI_CLOCK = 4000000; // 4 MHz
+    const uint32_t SD_SPI_CLOCK = 10000000; // 10 MHz
     
-    if (!SD.begin(SD_CS,SPI1)) {
+    if (!SD.begin(SD_CS, SD_SPI_CLOCK, SPI1)) {
         Serial.println("SD init fallita!");
         return false;
     }
